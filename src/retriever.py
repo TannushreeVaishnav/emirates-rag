@@ -1,23 +1,16 @@
 """
-retriever.py — FAISS vector-store wrapper.
+retriever.py — Hybrid search over the local FAISS document corpus.
 
-Loads the pre-built FAISS index from disk (built by src/ingest.py) and exposes
-a single `retrieve()` function used by the LangGraph agent and the eval runner.
-
-Design choices:
-  - @lru_cache on _store() so the embedding model and index are loaded only once
-    per process — important for Streamlit where every request hits the same server.
-  - MMR (Maximal Marginal Relevance) is an alternative search mode that trades
-    off a bit of relevance for more diverse results. I added it for Phase 8
-    experiments but it's off by default because similarity search performed better.
-  - Source-label prefix: during ingestion each chunk is prefixed with its source
-    filename (e.g. "[cabin baggage] Economy passengers...") so FAISS embeddings
-    capture the document topic as well as the content. This prefix is stripped
-    from retrieved documents before they reach the grader or generator, so
-    downstream prompts always receive clean prose.
+Vector search and BM25 keyword search contribute candidates, merged with
+reciprocal-rank fusion. This helps exact policy terms compete with semantic
+matches without treating rank or vector distance as answer confidence.
+The store and lexical postings are cached once per process. Returned documents
+are copies so cleaning legacy source-label prefixes never mutates the index.
 """
 
 import re
+import math
+from collections import Counter
 from functools import lru_cache
 
 from langchain_community.vectorstores import FAISS
@@ -50,6 +43,44 @@ def _store() -> FAISS:
     )
 
 
+_STOPWORDS = frozenset("a an the is are was were do does can i my me to of in on for and or what how about emirates".split())
+
+
+def _terms(text: str) -> list[str]:
+    return [t for t in re.findall(r"[a-z0-9]+", text.lower()) if t not in _STOPWORDS]
+
+
+@lru_cache(maxsize=1)
+def _lexical_index():
+    """Cache BM25 postings over the same indexed chunks; no second document corpus."""
+    store = _store()
+    docs = [store.docstore.search(key) for key in store.index_to_docstore_id.values()]
+    postings = {}
+    lengths = []
+    for index, doc in enumerate(docs):
+        terms = _terms(doc.metadata.get("source", "") + " " + doc.page_content)
+        lengths.append(len(terms))
+        for term, count in Counter(terms).items():
+            postings.setdefault(term, []).append((index, count))
+    return docs, postings, lengths, sum(lengths) / max(len(lengths), 1)
+
+
+def _keyword_search(query: str, k: int) -> list[Document]:
+    docs, postings, lengths, average = _lexical_index()
+    scores = Counter()
+    for term in set(_terms(query)):
+        matches = postings.get(term, [])
+        weight = math.log(1 + (len(docs) - len(matches) + 0.5) / (len(matches) + 0.5))
+        for index, count in matches:
+            norm = 1.2 * (0.25 + 0.75 * lengths[index] / max(average, 1))
+            scores[index] += weight * count * 2.2 / (count + norm)
+    return [docs[index] for index, _ in scores.most_common(k)]
+
+
+def _key(doc: Document) -> tuple:
+    return (doc.metadata.get("source"), doc.metadata.get("page"), _LABEL_RE.sub("", doc.page_content))
+
+
 def retrieve(query: str, k: int | None = None, mmr: bool | None = None) -> list[Document]:
     """
     Return the top-k most relevant document chunks for a query.
@@ -72,14 +103,26 @@ def retrieve(query: str, k: int | None = None, mmr: bool | None = None) -> list[
     mmr = settings.use_mmr if mmr is None else mmr
     store = _store()
 
+    candidates = max(k * 5, 20)
     if mmr:
-        # fetch_k=k*5 gives MMR a larger candidate pool to pick diverse results from
-        docs = store.max_marginal_relevance_search(query, k=k, fetch_k=k * 5)
+        dense = store.max_marginal_relevance_search(query, k=candidates, fetch_k=candidates * 2)
     else:
-        docs = store.similarity_search(query, k=k)
-
-    # Strip the source-label prefix — it served its purpose at embedding time.
-    for doc in docs:
-        doc.page_content = _LABEL_RE.sub("", doc.page_content)
-
-    return docs
+        dense = store.similarity_search(query, k=candidates)
+    lexical = _keyword_search(query, candidates)
+    # Reciprocal-rank fusion avoids treating vector distances as calibrated confidence.
+    scores = Counter()
+    documents = {}
+    for ranking in (dense, lexical):
+        seen = set()
+        for rank, doc in enumerate(ranking, 1):
+            key = _key(doc)
+            if key in seen:
+                continue
+            seen.add(key)
+            documents[key] = doc
+            scores[key] += 1 / (60 + rank)
+    return [
+        Document(page_content=_LABEL_RE.sub("", documents[key].page_content),
+                 metadata=dict(documents[key].metadata))
+        for key, _ in scores.most_common(k)
+    ]
