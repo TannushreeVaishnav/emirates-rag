@@ -11,23 +11,12 @@ Retrieval-Augmented Generation (RAG). Built as a final-year AI Engineering capst
 ## What it does
 
 - Answers policy questions from a 17-document knowledge base (PDFs scraped from emirates.com)
-- Grounds answers in retrieved passages and shows source passages and page numbers
-- Reports low confidence when the documents do not provide enough supporting evidence
-- Resolves follow-up questions using recent conversation context
+- Shows the exact source passage and page number for every answer
 - Refuses off-topic, price, or booking requests with a polite explanation
 - Detects and blocks prompt-injection attempts
 - Strips PII (emails, card numbers, passports) before it reaches any LLM or log
 - Falls back from Gemini to Groq automatically when rate limits hit
 - Remembers context across turns in a multi-turn conversation
-
-Retrieval combines vector similarity with BM25 keyword matching over the same
-indexed chunks, merging ranks and removing duplicate passages. Confidence is an
-evidence decision, not a calibrated percentage: insufficient evidence, invalid
-citations, or failed answer verification produce an explicit low-confidence
-response rather than an unverified policy answer. Keep `USE_GRADER` and
-`USE_OUTPUT_CHECK` enabled for normal use; disabling them weakens these checks.
-PDF cleanup preserves standalone numbers and repeated words, including negations:
-token-per-line extraction must not turn a policy limit or exception into missing text.
 
 ---
 
@@ -117,13 +106,11 @@ emirates-rag-bot/
 │   ├── run_redteam.py      # Red-team runner
 │   └── failures.py         # Post-eval failure analysis by bucket
 │
-├── tests/                  # Offline pytest suite
+├── tests/                  # pytest suite (52 tests, zero API calls)
 │   ├── test_guardrails.py  # PII, injection, output rules (31 tests)
 │   ├── test_gateway.py     # Failover, retry, forced-fail (7 tests)
-│   ├── test_graph_routes.py# Graph routing, memory, security, evidence checks
-│   ├── test_retriever.py   # Hybrid retrieval and cached-document isolation
-│   ├── test_ingest.py      # Preserve policy numbers and negations during PDF cleanup
-│   └── test_app.py         # Streamlit AppTest smoke test (requires built index)
+│   ├── test_graph_routes.py# Graph routing, memory, security (13 tests)
+│   └── test_app.py         # Streamlit AppTest smoke test
 │
 ├── data/
 │   ├── raw/                # Source PDFs (gitignored)
@@ -181,7 +168,7 @@ streamlit run app.py
 
 ## Running the tests
 
-The suite makes no live LLM API calls. The UI test requires a built knowledge-base index.
+All 52 tests run offline — no API keys or network access needed.
 
 ```bash
 pytest tests/ -v
@@ -239,7 +226,7 @@ Results are saved to `eval/results/summary.md` and per-question CSVs.
 - **Retrieval evaluation framework** with hit-rate@k, LLM-as-judge
   faithfulness/relevance scoring, refusal accuracy, and a grid-search
   experiment runner across 6 chunking configs × 5 retriever configs.
-- **Offline tests** using monkeypatching so the full graph, guardrails,
+- **52 offline tests** using monkeypatching so the full graph, guardrails,
   and gateway are tested without any API calls.
 
 ---
@@ -252,14 +239,6 @@ Results are saved to `eval/results/summary.md` and per-question CSVs.
 - The LLM judge used for evaluation is the same model family as the generator,
   which may inflate faithfulness scores.
 - Free-tier rate limits affect latency; p95 may exceed 6 s under load.
-
-Policy freshness means whether the local documents still match Emirates' current
-published rules. `data/sources.csv` records collection dates, not policy effective
-dates or proof that a source is still current. Refresh manually: check each original
-URL, replace changed files in `data/raw`, update collection dates only after actually
-collecting the source, run `python -m src.ingest`, and restart the app so cached
-retrieval data reloads. Rebuilding the index alone does not fetch newer policies.
-There is no automatic source-refresh job.
 
 ---
 

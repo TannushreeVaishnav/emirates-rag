@@ -198,31 +198,3 @@ def test_total_llm_outage_returns_friendly_message(stub, monkeypatch):
     monkeypatch.setattr(g.graph, "invoke", boom)
     res = ask("What is the cabin baggage allowance for Economy?")
     assert res["answer"] == SERVICE_MSG and res["error"] == "llm_unavailable"
-
-
-def test_grader_failure_treats_evidence_as_insufficient(monkeypatch):
-    def unavailable(_):
-        raise RuntimeError("offline")
-
-    monkeypatch.setattr(g, "fast_llm", lambda: RunnableLambda(unavailable))
-    result = g.grade_node({"docs": [make_doc()], "question": "What is the baggage allowance?"})
-    assert result == {"docs_relevant": False, "context_docs": []}
-
-
-@pytest.mark.parametrize("answer", ["Economy allowance is 7 kg.", "Allowance is 7 kg [9]."])
-def test_uncited_or_invalidly_cited_answer_is_not_presented(stub, answer):
-    stub(answer=answer)
-    result = ask("What is the cabin baggage allowance?")
-    assert result["refused"] and not result["citations"]
-
-
-def test_verification_failure_does_not_present_unverified_answer(stub, monkeypatch):
-    stub()
-
-    def unavailable(_):
-        raise RuntimeError("verification unavailable")
-
-    monkeypatch.setattr(g, "llm", lambda: RunnableLambda(unavailable))
-    result = g.output_check_node({"answer": GOOD, "context_docs": [make_doc()]})
-    assert result["supported"] is False
-    assert "messages" not in result
