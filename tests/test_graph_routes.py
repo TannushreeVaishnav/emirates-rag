@@ -1,7 +1,7 @@
 """
 tests/test_graph_routes.py — Integration tests for the LangGraph agent routing.
 
-All 13 tests run fully offline: no API keys or network access needed.
+These tests run fully offline: no provider API calls.
 The `stub` fixture monkeypatches llm(), fast_llm(), retrieve(), and log_request()
 so the graph runs through its full conditional-edge logic using synthetic responses.
 
@@ -198,3 +198,20 @@ def test_total_llm_outage_returns_friendly_message(stub, monkeypatch):
     monkeypatch.setattr(g.graph, "invoke", boom)
     res = ask("What is the cabin baggage allowance for Economy?")
     assert res["answer"] == SERVICE_MSG and res["error"] == "llm_unavailable"
+
+
+def test_repeated_question_after_other_topic_uses_same_evidence(stub, monkeypatch):
+    stub()
+    queries = []
+    def capture(question):
+        queries.append(question)
+        return [make_doc()]
+    monkeypatch.setattr(g, "retrieve", capture)
+    tid = str(uuid.uuid4())
+    question = "What is the cabin baggage allowance for Economy?"
+    first = ask(question, tid)
+    ask("Can I cancel my ticket and get a refund?", tid)
+    repeated = ask(question, tid)
+    assert queries[0] == queries[2] == question
+    assert first["answer"] == repeated["answer"] == GOOD
+    assert first["citations"] == repeated["citations"]

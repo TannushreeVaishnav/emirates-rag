@@ -11,12 +11,22 @@ Retrieval-Augmented Generation (RAG). Built as a final-year AI Engineering capst
 ## What it does
 
 - Answers policy questions from a 17-document knowledge base (PDFs scraped from emirates.com)
-- Shows the exact source passage and page number for every answer
+- Shows clickable inline citations linked to original sources, with source passages and page numbers
 - Refuses off-topic, price, or booking requests with a polite explanation
 - Detects and blocks prompt-injection attempts
 - Strips PII (emails, card numbers, passports) before it reaches any LLM or log
 - Falls back from Gemini to Groq automatically when rate limits hit
 - Remembers context across turns in a multi-turn conversation
+
+Retrieval combines vector similarity with BM25 keyword matching over the same
+indexed chunks, using reciprocal-rank fusion and passage deduplication. PDF cleanup
+preserves policy numbers, negations, and section ancestry, including regional
+qualifications. Standalone questions are not rewritten using unrelated chat history.
+
+Provider outages and failed evidence assessment produce a service/verification
+error, not a claim that the policy is absent. A rate-limited provider/model is
+skipped for the rest of that turn; a new turn may try it again. No policy answer
+passes through merely because its grader or support checker is unavailable.
 
 ---
 
@@ -85,7 +95,7 @@ emirates-rag-bot/
 ├── src/                    # Core library (importable as `src.*`)
 │   ├── config.py           # All settings; reads .env
 │   ├── ingest.py           # PDF/MD → clean → chunk → embed → FAISS
-│   ├── retriever.py        # FAISS similarity / MMR search
+│   ├── retriever.py        # Hybrid FAISS/BM25 retrieval
 │   ├── rag_chain.py        # Baseline RAG chain (Phase 3)
 │   ├── graph.py            # LangGraph agent (Phase 5+)
 │   ├── prompts.py          # All LangChain prompt templates
@@ -106,10 +116,13 @@ emirates-rag-bot/
 │   ├── run_redteam.py      # Red-team runner
 │   └── failures.py         # Post-eval failure analysis by bucket
 │
-├── tests/                  # pytest suite (52 tests, zero API calls)
-│   ├── test_guardrails.py  # PII, injection, output rules (31 tests)
-│   ├── test_gateway.py     # Failover, retry, forced-fail (7 tests)
-│   ├── test_graph_routes.py# Graph routing, memory, security (13 tests)
+├── tests/                  # Offline regression suite; no live provider calls
+│   ├── test_guardrails.py  # PII, injection, output rules
+│   ├── test_gateway.py     # Failover, retry, rate-limit suppression/recovery
+│   ├── test_graph_routes.py# Routing, memory, repeated questions, security
+│   ├── test_ingest.py      # Policy facts, section ancestry, PDF cleanup
+│   ├── test_retriever.py   # Hybrid retrieval and cached-document isolation
+│   ├── test_evidence.py    # Evidence failures and clickable citations
 │   └── test_app.py         # Streamlit AppTest smoke test
 │
 ├── data/
@@ -127,7 +140,9 @@ emirates-rag-bot/
 
 ## Setup
 
-**Prerequisites:** Python 3.11+, Git, ~2 GB free on a non-C drive (for model cache).
+**Prerequisites:** Python 3.11+, Git, and space for the local embedding model.
+Set `HF_HOME` if you need a custom cache location; the app otherwise uses the
+Hugging Face default.
 
 ```bash
 # 1. Clone and create a virtual environment
@@ -155,6 +170,16 @@ python -m src.ingest
 streamlit run app.py
 ```
 
+After changing ingestion or replacing policy documents, rebuild the index and
+restart Streamlit so its cached retriever reloads. Rebuilding does not download
+newer policies. Collection dates in `data/sources.csv` are not proof that a
+policy is still current.
+
+The Streamlit file watcher is disabled to avoid introspection of Transformers'
+optional vision modules. Restart the server after Python/configuration changes;
+browser refresh alone does not reload the cached backend. `torchvision` is not
+required for this text-only application.
+
 ---
 
 ## API keys
@@ -168,7 +193,9 @@ streamlit run app.py
 
 ## Running the tests
 
-All 52 tests run offline — no API keys or network access needed.
+The regression suite makes no live LLM API calls. The UI smoke test requires a
+built index. Tests cover policy-preserving extraction, hybrid retrieval, repeated
+questions, rate-limit suppression/recovery, evidence-check failures, and citations.
 
 ```bash
 pytest tests/ -v
@@ -206,6 +233,7 @@ Results are saved to `eval/results/summary.md` and per-question CSVs.
 | `GROQ_MODEL` | `openai/gpt-oss-120b` | Fallback LLM |
 | `TOP_K` | `4` | Chunks retrieved per query |
 | `CHUNK_SIZE` | `900` | Characters per chunk |
+| `TEMPERATURE` | `0.0` | Reduce generation/assessment variation; does not guarantee determinism |
 | `USE_GRADER` | `true` | Enable relevance grading |
 | `USE_OUTPUT_CHECK` | `true` | Enable output verification |
 | `FORCE_PRIMARY_FAIL` | `false` | Force Groq fallback (testing) |
@@ -226,8 +254,8 @@ Results are saved to `eval/results/summary.md` and per-question CSVs.
 - **Retrieval evaluation framework** with hit-rate@k, LLM-as-judge
   faithfulness/relevance scoring, refusal accuracy, and a grid-search
   experiment runner across 6 chunking configs × 5 retriever configs.
-- **52 offline tests** using monkeypatching so the full graph, guardrails,
-  and gateway are tested without any API calls.
+- **Offline regression tests** using monkeypatching so the graph, guardrails,
+  gateway, citation handling, and UI can be exercised without live provider calls.
 
 ---
 

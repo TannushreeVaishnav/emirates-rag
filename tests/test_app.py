@@ -54,3 +54,4 @@ def test_app_answers_a_question(monkeypatch):
     at.chat_input[0].set_value("What is the cabin baggage allowance?").run()
     assert not at.exception
     assert any("7 kg" in m.value for m in at.markdown)
+    assert any("[[1]](https://example.com)" in m.value for m in at.markdown)

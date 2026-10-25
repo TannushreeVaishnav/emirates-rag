@@ -20,11 +20,13 @@ Usage:
 """
 
 import time
+import re
+from urllib.parse import urlsplit
 
 from langchain_core.output_parsers import StrOutputParser
 
 from src.config import settings
-from src.llm_gateway import get_llm
+from src.llm_gateway import get_llm, start_tracking
 from src.prompts import GENERATION_PROMPT, NO_ANSWER_MSG
 from src.retriever import retrieve
 
@@ -53,6 +55,33 @@ def format_context(docs: list) -> str:
     return "\n".join(lines)
 
 
+def normalize_citations(answer: str) -> str:
+    """Canonicalize numeric citation markers without inventing references."""
+    return re.sub(r"【(\d+)(?:†[^】]*)?】", r"[\1]", answer)
+
+
+def citation_numbers(answer: str) -> list[int]:
+    return [int(n) for n in re.findall(r"\[(\d+)\]", normalize_citations(answer))]
+
+
+def citation_markdown(answer: str, citations: list[dict]) -> str:
+    """Link only references backed by a structured source with an HTTP(S) URL."""
+    urls = {}
+    for citation in citations:
+        url = citation.get("url", "")
+        parsed = urlsplit(url)
+        if parsed.scheme in {"http", "https"} and parsed.netloc:
+            if citation.get("page") and parsed.path.lower().endswith(".pdf") and not parsed.fragment:
+                url += f"#page={citation['page']}"
+            urls[citation["ref"]] = url.replace("(", "%28").replace(")", "%29")
+    return re.sub(
+        r"\[(\d+)\]",
+        lambda match: f"[[{match[1]}]]({urls[int(match[1])]})"
+        if int(match[1]) in urls else match[0],
+        normalize_citations(answer),
+    )
+
+
 def build_citations(docs: list, answer: str) -> list[dict]:
     """
     Build the citations list from documents whose index was referenced in the answer.
@@ -65,9 +94,10 @@ def build_citations(docs: list, answer: str) -> list[dict]:
         List of dicts with keys: ref, source, section, page, url, date_collected, text.
     """
     citations = []
+    references = set(citation_numbers(answer))
     for i, doc in enumerate(docs, start=1):
         # Only include this doc if its citation number actually appears in the answer
-        if f"[{i}]" in answer:
+        if i in references:
             m = doc.metadata
             citations.append({
                 "ref": i,
@@ -76,7 +106,7 @@ def build_citations(docs: list, answer: str) -> list[dict]:
                 "page": m.get("page"),
                 "url": m.get("url", ""),
                 "date_collected": m.get("date_collected", ""),
-                "text": doc.page_content[:600],   # short snippet for the UI
+                "text": doc.page_content,
             })
     return citations
 
@@ -97,6 +127,7 @@ def ask(question: str) -> dict:
             latency     — wall-clock seconds for the full call
     """
     t0 = time.perf_counter()
+    start_tracking()
     docs = retrieve(question)
 
     chain = GENERATION_PROMPT | get_llm() | StrOutputParser()

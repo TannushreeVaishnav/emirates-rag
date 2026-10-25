@@ -50,13 +50,17 @@ from src.prompts import (
     ROUTER_PROMPT,
     SERVICE_MSG,
 )
-from src.rag_chain import build_citations, format_context
+from src.rag_chain import build_citations, citation_numbers, format_context, normalize_citations
 from src.retriever import retrieve
 from src.tools import flight_status_reply
 
 log = logging.getLogger("graph")
 # All valid route labels the router can emit; anything else defaults to "policy".
 ROUTES = {"policy", "flight_status", "chitchat", "out_of_scope"}
+
+
+class EvidenceCheckFailed(RuntimeError):
+    """Evidence could not be assessed; this is not a missing-document result."""
 
 
 class GraphState(TypedDict, total=False):
@@ -128,7 +132,7 @@ def _history(messages: list, limit: int = 6) -> str:
     lines = []
     for m in messages[-limit:]:
         who = "User" if isinstance(m, HumanMessage) else "Assistant"
-        lines.append(f"{who}: {str(m.content)[:400]}")
+        lines.append(f"{who}: {str(m.content)[:1200]}")
     return "\n".join(lines) or "(none)"
 
 
@@ -191,10 +195,12 @@ def router_node(state: GraphState) -> dict:
         if not isinstance(out, dict):
             raise ValueError("router returned non-dict")
         route = out.get("route")
-        standalone = (out.get("standalone_question") or question).strip()
+        standalone = (out.get("standalone_question") or question).strip() if out.get("is_followup") is True else question
         attack = bool(out.get("attack", False))
         if route not in ROUTES:
             route = "policy"
+    except AllProvidersFailed:
+        raise
     except Exception as e:
         log.warning("router failed (%s); defaulting to policy", str(e)[:80])
         route, standalone, attack = "policy", question, False
@@ -237,7 +243,7 @@ def grade_node(state: GraphState) -> dict:
     baggage-weight chunk retrieved for a check-in question) before generation.
 
     Gated on settings.use_grader so it can be disabled for ablation studies.
-    On exception, all docs are kept (fail-open) to avoid silent refusals.
+    Provider failures propagate; malformed assessment is a verification failure.
     """
     docs = state.get("docs", [])
     if not docs:
@@ -245,16 +251,21 @@ def grade_node(state: GraphState) -> dict:
     if not settings.use_grader:
         return {"docs_relevant": True, "context_docs": docs}
 
-    passages = "\n\n".join(f"[{i}] {d.page_content[:700]}" for i, d in enumerate(docs, start=1))
+    passages = "\n\n".join(f"[{i}] {d.page_content}" for i, d in enumerate(docs, start=1))
     try:
         out = (GRADER_PROMPT | fast_llm() | JsonOutputParser()).invoke(
             {"question": state["question"], "passages": passages}
         )
-        keep_ids = {int(n) for n in out.get("relevant", []) if str(n).strip().isdigit()}
+        if not isinstance(out, dict) or not isinstance(out.get("relevant"), list):
+            raise ValueError("invalid relevance assessment")
+        if any(type(n) is not int or not 1 <= n <= len(docs) for n in out["relevant"]):
+            raise ValueError("invalid passage reference")
+        keep_ids = set(out["relevant"])
         keep = [d for i, d in enumerate(docs, start=1) if i in keep_ids]
+    except AllProvidersFailed:
+        raise
     except Exception as e:
-        log.warning("grader failed (%s); keeping all docs", str(e)[:80])
-        keep = docs
+        raise EvidenceCheckFailed("Passage relevance could not be verified") from e
     return {"docs_relevant": bool(keep), "context_docs": keep}
 
 
@@ -284,6 +295,7 @@ def generate_node(state: GraphState) -> dict:
     answer = (GENERATION_PROMPT | llm() | StrOutputParser()).invoke(
         {"context": format_context(docs), "question": state["question"]}
     ).strip()
+    answer = normalize_citations(answer)
     refused = answer.startswith(NO_ANSWER_MSG[:40])
     return {"answer": answer, "citations": [] if refused else build_citations(docs, answer)}
 
@@ -307,6 +319,9 @@ def output_check_node(state: GraphState) -> dict:
         context = "\n\n".join(d.page_content for d in state["context_docs"])
         # Step 1: fast deterministic rules (no LLM call needed)
         violations = check_output_rules(answer, context)
+        references = citation_numbers(answer)
+        if not references or any(n < 1 or n > len(state["context_docs"]) for n in references):
+            violations.append("missing_or_invalid_citations")
         if violations:
             log.warning("output rules violated: %s", violations)
             ok = False
@@ -314,11 +329,15 @@ def output_check_node(state: GraphState) -> dict:
             # Step 2: LLM-based faithfulness check
             try:
                 out = (CHECK_PROMPT | llm() | JsonOutputParser()).invoke(
-                    {"context": context[:6000], "answer": answer}
+                    {"context": format_context(state["context_docs"]), "answer": answer}
                 )
-                ok = bool(out.get("supported", True))
+                if not isinstance(out, dict) or not isinstance(out.get("supported"), bool):
+                    raise ValueError("invalid support assessment")
+                ok = out["supported"] is True
+            except AllProvidersFailed:
+                raise
             except Exception as e:
-                log.warning("output check failed (%s); letting answer through", str(e)[:80])
+                raise EvidenceCheckFailed("Answer support could not be verified") from e
     update: dict = {"supported": ok}
     if ok:
         update["messages"] = [AIMessage(content=answer)]
@@ -475,7 +494,14 @@ def chat(message: str, thread_id: str = "default") -> dict:
         )
     except AllProvidersFailed as e:
         log.error("%s", e)
-        state, error = {"answer": SERVICE_MSG}, "llm_unavailable"
+        state = dict(graph.get_state({"configurable": {"thread_id": thread_id}}).values)
+        state.update(answer=SERVICE_MSG, citations=[])
+        error = "llm_unavailable"
+    except EvidenceCheckFailed as e:
+        log.warning("%s", e)
+        state = dict(graph.get_state({"configurable": {"thread_id": thread_id}}).values)
+        state.update(answer=SERVICE_MSG, citations=[])
+        error = "evidence_unverified"
 
     latency = time.perf_counter() - t0
     answer = state.get("answer", "")
@@ -501,6 +527,11 @@ def chat(message: str, thread_id: str = "default") -> dict:
         "error": error,
         "latency": latency,
     }
+    result["outcome"] = error or (
+        "unsupported_answer" if state.get("supported") is False
+        else "no_evidence" if answer == NO_ANSWER_MSG
+        else "refused" if result["refused"] else "answered"
+    )
     log.info(
         "route=%s retries=%d blocked=%s provider=%s latency=%.1fs",
         result["route"],
@@ -516,6 +547,18 @@ def chat(message: str, thread_id: str = "default") -> dict:
         "blocked_reason": result["blocked_reason"],
         "pii_types": result["pii_types"],
         "retries": result["retries"],
+        "outcome": result["outcome"],
+        "retrieval_question": state.get("question", "")[:1000],
+        "retrieved_passages": [
+            {"source": d.metadata.get("source"), "page": d.metadata.get("page"),
+             "section": d.metadata.get("section")}
+            for d in result["docs"]
+        ],
+        "selected_passages": [
+            {"source": d.metadata.get("source"), "page": d.metadata.get("page"),
+             "section": d.metadata.get("section")}
+            for d in result["context_docs"]
+        ],
         "sources": sorted({d.metadata["source"] for d in result["context_docs"]}),
         "provider_used": result["provider_used"],
         "llm_calls": result["llm_calls"],

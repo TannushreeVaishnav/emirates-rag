@@ -22,7 +22,7 @@ Run:
 """
 # ── IMPORTANT: must be set before any src.* import loads the embedding model ──
 import os
-os.environ.setdefault("HF_HOME", "D:/hf_cache")
+# Keep Hugging Face's portable default cache unless the operator sets HF_HOME.
 os.environ.setdefault("OPENBLAS_NUM_THREADS", "1")
 os.environ.setdefault("OMP_NUM_THREADS", "1")
 # ───────────────────────────────────────────────────────────────────────────────
@@ -37,6 +37,7 @@ import streamlit as st
 
 from src.config import settings
 from src.logging_utils import hash_id
+from src.rag_chain import citation_markdown
 
 st.set_page_config(
     page_title="Emirates Policy Assistant (unofficial)",
@@ -175,8 +176,6 @@ def render_sources(citations: list[dict]) -> None:
             page = f", p.{c['page']}" if c.get("page") else ""
             st.markdown(f"**[{c['ref']}]** `{c['source']}` · {md(c['section'])}{page}")
             snippet = " ".join(c["text"].split())
-            if len(snippet) > 400:
-                snippet = snippet[:400].rsplit(" ", 1)[0] + "…"
             st.markdown("> " + md(snippet))
             st.markdown(f"[Open original]({c['url']}) · collected {c['date_collected']}")
 
@@ -184,7 +183,8 @@ def render_sources(citations: list[dict]) -> None:
 def render_history() -> None:
     for m in st.session_state.messages:
         with st.chat_message(m["role"]):
-            st.markdown(md(m["content"]))
+            content = citation_markdown(m["content"], m.get("citations", [])) if m["role"] == "assistant" else m["content"]
+            st.markdown(md(content))
             if m["role"] != "assistant":
                 continue
             if m.get("citations"):
@@ -206,14 +206,6 @@ def render_history() -> None:
                     args=(m["id"],),
                 )
 
-
-def answer_question(prompt: str) -> None:
-    user_msg_id = uuid.uuid4().hex[:8]
-    st.session_state.messages.append(
-        {"id": user_msg_id, "role": "user", "content": prompt}
-    )
-    with st.chat_message("user"):
-        st.markdown(md(prompt))
 
 def answer_question(prompt: str) -> None:
     user_msg_id = uuid.uuid4().hex[:8]
