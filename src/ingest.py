@@ -12,8 +12,8 @@ Key design decisions:
   - Structure-aware PDF splitting: the Emirates Conditions of Carriage uses
     article headings (ARTICLE 7 — REFUSAL OF CARRIAGE). Splitting on these
     boundaries keeps each chunk self-contained and improves citation accuracy.
-  - Conservative cleanup: explicit page labels, navigation text, and TOC
-    dot-leaders are stripped; repeated words and numeric policy limits survive.
+  - Boilerplate removal: page numbers, repeated headers/footers, and TOC
+    dot-leaders are stripped before chunking so they don't pollute embeddings.
   - stats.json: written alongside the index so the Phase 8 experiment runner
     can read the chunk count and settings without re-loading the index.
 
@@ -29,6 +29,7 @@ import csv
 import json
 import logging
 import re
+from collections import Counter
 from pathlib import Path
 
 from langchain_community.vectorstores import FAISS
@@ -52,9 +53,9 @@ log = logging.getLogger("ingest")
 ARTICLE_RE = re.compile(
     r"^\s*(?:ARTICLE\s+)?(\d{1,2})\s*(?:[.\s—–\-]+)\s*([A-Z][A-Z0-9 ,&/'()\-]{3,})\s*$"
 )
-# Only explicit page labels are safe to remove. Bare numbers and repeated words
-# can be policy facts in token-per-line PDFs (e.g. "48", "not", "100").
-PAGE_NUM_RE = re.compile(r"^page\s+\d+(\s*(of|/)\s*\d+)?$", re.IGNORECASE)
+# Lines that appear on almost every PDF page (page numbers, footers).
+# A line is treated as boilerplate if it appears on > 30% of pages.
+PAGE_NUM_RE = re.compile(r"^(page\s*)?\d+(\s*(of|/)\s*\d+)?$", re.IGNORECASE)
 NAV_NOISE = (
     "skip to the main content",
     "accessibility information",
@@ -112,6 +113,11 @@ def load_pdf(path: Path, meta: dict, structured: bool) -> list[Document]:
     pages = [p.extract_text() or "" for p in PdfReader(path).pages]
     lines_per_page = [[l.strip() for l in t.splitlines()] for t in pages]
 
+    # Repeated short lines across many pages are headers/footers.
+    counts = Counter(l for lines in lines_per_page for l in set(lines) if l)
+    threshold = max(3, int(0.3 * len(pages)))
+    boilerplate = {l for l, c in counts.items() if c >= threshold and len(l) < 100}
+
     segments: list[tuple[str, int, str]] = []   # (section, page, text)
     section = "General"
     for pno, lines in enumerate(lines_per_page, start=1):
@@ -119,7 +125,7 @@ def load_pdf(path: Path, meta: dict, structured: bool) -> list[Document]:
         is_toc_page = structured and pno == 2
         buf: list[str] = []
         for line in lines:
-            if PAGE_NUM_RE.match(line):
+            if line in boilerplate or PAGE_NUM_RE.match(line):
                 continue
             m = ARTICLE_RE.match(line) if (structured and not is_toc_page) else None
             if m:
