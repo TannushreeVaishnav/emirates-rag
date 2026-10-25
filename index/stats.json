@@ -1,0 +1,9 @@
+{
+  "chunks": 655,
+  "avg_chars": 529,
+  "max_chars": 934,
+  "chunk_size": 900,
+  "chunk_overlap": 150,
+  "structure_aware": true,
+  "embedding_model": "BAAI/bge-small-en-v1.5"
+}

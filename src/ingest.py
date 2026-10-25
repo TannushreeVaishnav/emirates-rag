@@ -12,8 +12,8 @@ Key design decisions:
   - Structure-aware PDF splitting: the Emirates Conditions of Carriage uses
     article headings (ARTICLE 7 — REFUSAL OF CARRIAGE). Splitting on these
     boundaries keeps each chunk self-contained and improves citation accuracy.
-  - Boilerplate removal: page numbers, repeated headers/footers, and TOC
-    dot-leaders are stripped before chunking so they don't pollute embeddings.
+  - Layout-preserving extraction keeps headings, numbers, and repeated policy
+    words intact; only explicitly labelled page numbers and navigation are removed.
   - stats.json: written alongside the index so the Phase 8 experiment runner
     can read the chunk count and settings without re-loading the index.
 
@@ -29,7 +29,6 @@ import csv
 import json
 import logging
 import re
-from collections import Counter
 from pathlib import Path
 
 from langchain_community.vectorstores import FAISS
@@ -53,9 +52,9 @@ log = logging.getLogger("ingest")
 ARTICLE_RE = re.compile(
     r"^\s*(?:ARTICLE\s+)?(\d{1,2})\s*(?:[.\s—–\-]+)\s*([A-Z][A-Z0-9 ,&/'()\-]{3,})\s*$"
 )
-# Lines that appear on almost every PDF page (page numbers, footers).
-# A line is treated as boilerplate if it appears on > 30% of pages.
-PAGE_NUM_RE = re.compile(r"^(page\s*)?\d+(\s*(of|/)\s*\d+)?$", re.IGNORECASE)
+# Bare numbers may be policy limits, not page numbers.
+PAGE_NUM_RE = re.compile(r"^page\s+\d+(\s*(of|/)\s*\d+)?$", re.IGNORECASE)
+PDF_HEADING_RE = re.compile(r"^\d+(?:\.\d+)*\.?\s+[A-Z][^\n.!?]{0,100}$")
 NAV_NOISE = (
     "skip to the main content",
     "accessibility information",
@@ -73,32 +72,35 @@ splitter = RecursiveCharacterTextSplitter(
 
 
 def clean_text(text: str) -> str:
-    """
-    Normalise and de-noise raw extracted text.
-
-    These PDFs are extracted with a `word\n \nword` layout (a newline + single
-    space between every token). The first step collapses that pattern into normal
-    prose so downstream splitting and embedding work correctly.
-
-    Also removes hyphenated line-breaks, TOC dot-leaders, repeated navigation
-    fragments, and excess whitespace.
-    """
-    text = text.replace("\r", "")
-
-    # Fix the single-space-per-token extraction layout: "word\n \nword" → "word word"
-    # This is the most common quality issue in these Emirates FAQs.
-    text = re.sub(r"(\w)\n +(\w)", r"\1 \2", text)
-    # Second pass: collapse remaining isolated newlines between words (no leading space)
-    text = re.sub(r"(\w)\n(\w)", r"\1 \2", text)
-
-    # Remove trailing RAG Metadata block if present in document
-    if "RAG Metadata" in text:
-        text = text.split("RAG Metadata")[0]
-    # Remove meta prompts
-    text = re.sub(r"Answering instruction:.*", "", text, flags=re.IGNORECASE)
-    # Rejoin hyphenated line-breaks: "bagga-\nge" → "baggage"
-    text = re.sub(r"(\w)-\s*\n\s*(\w)", r"\1\2", text)
-    # Remove TOC dot leaders (e.g. .............13)
+    """Normalise extracted tokens without flattening real paragraph boundaries."""
+    text = text.replace("\r\n", "\n").replace("\r", "\n")
+    text = re.sub(r"(\w)-[ \t]*\n[ \t]*(\w)", r"\1\2", text)
+    # Token-per-line PDFs use a whitespace-only line between every token.
+    # Do this before trimming lines, which would make these indistinguishable
+    # from genuine blank paragraph separators.
+    text = re.sub(r"(?<=\S)\n[ \t]+\n(?=\S)", " ", text)
+    text = re.sub(
+        r"(?m)^(?:[^\s]+\n){2,}[^\s]+$",
+        lambda match: " ".join(match.group().split()),
+        text,
+    )
+    # Also handle runs of bare, blank-line-separated tokens. Multiword
+    # paragraphs/headings delimit runs and retain their original boundaries.
+    paragraphs = re.split(r"\n[ \t]*\n", text)
+    normalised: list[str] = []
+    tokens: list[str] = []
+    for paragraph in paragraphs:
+        if paragraph.strip() and len(paragraph.split()) == 1:
+            tokens.append(paragraph.strip())
+        else:
+            if tokens:
+                normalised.append(" ".join(tokens))
+                tokens = []
+            normalised.append(paragraph.strip())
+    if tokens:
+        normalised.append(" ".join(tokens))
+    text = "\n\n".join(normalised)
+    # Remove TOC dot leaders (e.g. .............13).
     text = re.sub(r"\.{3,}\s*\d+", "", text)
     # Remove common navigation noise
     text = "\n".join(
@@ -110,46 +112,67 @@ def clean_text(text: str) -> str:
 
 
 def load_pdf(path: Path, meta: dict, structured: bool) -> list[Document]:
-    pages = [p.extract_text() or "" for p in PdfReader(path).pages]
-    lines_per_page = [[l.strip() for l in t.splitlines()] for t in pages]
-
-    # Repeated short lines across many pages are headers/footers.
-    counts = Counter(l for lines in lines_per_page for l in set(lines) if l)
-    threshold = max(3, int(0.3 * len(pages)))
-    boilerplate = {l for l, c in counts.items() if c >= threshold and len(l) < 100}
-
+    # Layout extraction reconstructs physical lines from PDF coordinates instead
+    # of treating every drawn token as a paragraph.
+    pages = [p.extract_text(extraction_mode="layout") or "" for p in PdfReader(path).pages]
     segments: list[tuple[str, int, str]] = []   # (section, page, text)
     section = "General"
-    for pno, lines in enumerate(lines_per_page, start=1):
-        # Ignore TOC page in CoC (page 2) for heading discovery to avoid duplicate headings
+    heading_path: list[tuple[str, str]] = []
+    for pno, page in enumerate(pages, start=1):
         is_toc_page = structured and pno == 2
         buf: list[str] = []
-        for line in lines:
-            if line in boilerplate or PAGE_NUM_RE.match(line):
+        for line in clean_text(page).splitlines():
+            line = line.strip()
+            if PAGE_NUM_RE.fullmatch(line):
                 continue
-            m = ARTICLE_RE.match(line) if (structured and not is_toc_page) else None
-            if m:
-                if buf:
+            article = ARTICLE_RE.match(line) if (structured and not is_toc_page) else None
+            is_heading = article is not None or (
+                not structured and PDF_HEADING_RE.fullmatch(line) is not None
+            )
+            if is_heading:
+                if any(buf) and "\n".join(buf).strip() != section:
                     segments.append((section, pno, "\n".join(buf)))
-                    buf = []
-                section = f"Article {m.group(1)}: {m.group(2).title()}"
-            buf.append(line)
-        if buf:
+                if article:
+                    section = f"Article {article.group(1)}: {article.group(2).title()}"
+                else:
+                    number = re.match(r"^(\d+(?:\.\d+)*)", line).group(1)
+                    heading_path = [
+                        (parent_number, title) for parent_number, title in heading_path
+                        if number.startswith(parent_number + ".")
+                    ]
+                    heading_path.append((number, line))
+                    section = " > ".join(title for _, title in heading_path)
+                buf = [section]
+            else:
+                buf.append(line)
+        if any(buf) and "\n".join(buf).strip() != section:
             segments.append((section, pno, "\n".join(buf)))
 
     chunks = []
     for sec, pno, text in segments:
         cleaned = clean_text(text)
+        # Repeat the section heading on every continuation chunk so allowances
+        # remain attributable to their cabin class even across page boundaries.
+        prefix = "" if sec == "General" else f"{sec}\n"
         # Prepend the source filename (without extension) to each chunk so the
         # embedding captures the document topic, not just the passage content.
         # This helps FAISS distinguish "cabin_baggage" chunks from "checked_baggage"
         # chunks when a query like "cabin baggage allowance" is ambiguous.
         source_label = meta.get("source", "").replace("_", " ").replace(".pdf", "")
-        for piece in splitter.split_text(cleaned):
-            if len(piece) > 40:
+        available = max(1, settings.chunk_size - len(prefix))
+        section_splitter = RecursiveCharacterTextSplitter(
+            chunk_size=available,
+            chunk_overlap=min(settings.chunk_overlap, available - 1),
+            separators=["\n\n", "\n", ". ", " ", ""],
+        )
+        for piece in section_splitter.split_text(cleaned):
+            if piece.strip():
                 chunks.append(
                     Document(
-                        page_content=f"[{source_label}] {piece}",
+                        page_content=(
+                            f"[{source_label}] "
+                            f"{'' if piece.startswith(sec) else prefix}{piece}"
+                        ),
                         metadata={**meta, "section": sec, "page": pno},
                     )
                 )
@@ -165,7 +188,7 @@ def load_markdown(path: Path, meta: dict) -> list[Document]:
                 page_content=f"[{source_label}] {p}",
                 metadata={**meta, "section": "General", "page": None},
             )
-            for p in splitter.split_text(text) if len(p) > 40
+            for p in splitter.split_text(text) if p.strip()
         ]
     md_split = MarkdownHeaderTextSplitter(
         [("#", "h1"), ("##", "h2"), ("###", "h3")], strip_headers=False
@@ -174,7 +197,7 @@ def load_markdown(path: Path, meta: dict) -> list[Document]:
     for part in md_split.split_text(text):
         section = " > ".join(part.metadata[k] for k in ("h1", "h2", "h3") if k in part.metadata)
         for piece in splitter.split_text(part.page_content):
-            if len(piece) > 40:
+            if piece.strip():
                 chunks.append(
                     Document(
                         page_content=f"[{source_label}] {piece}",
