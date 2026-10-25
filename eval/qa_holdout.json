@@ -1,0 +1,12 @@
+[
+  {"id":"h01","category":"direct","question":"What is the maximum weight for a single piece of checked baggage in Economy?","history":[],"expected_answer":"","source_doc":["checked_baggage.pdf"],"gold_keyword":"","should_refuse":false},
+  {"id":"h02","category":"direct","question":"Can I check in at the airport if I have already checked in online?","history":[],"expected_answer":"","source_doc":["checkin_options.pdf"],"gold_keyword":"","should_refuse":false},
+  {"id":"h03","category":"direct","question":"What is Emirates' policy on carrying musical instruments in the cabin?","history":[],"expected_answer":"","source_doc":["cabin_baggage.pdf"],"gold_keyword":"","should_refuse":false},
+  {"id":"h04","category":"direct","question":"What documents do I need for an unaccompanied minor to travel?","history":[],"expected_answer":"","source_doc":["special_assistance.pdf"],"gold_keyword":"minor","should_refuse":false},
+  {"id":"h05","category":"multi","question":"I have a connecting flight and my checked baggage is lost. What are my rights and what should I do?","history":[],"expected_answer":"","source_doc":["delayed_damaged_baggage.pdf","emirates_conditions_of_carriage.pdf"],"gold_keyword":"","should_refuse":false},
+  {"id":"h06","category":"multi","question":"Can I carry dry ice in my checked baggage, and if so, how much is allowed?","history":[],"expected_answer":"","source_doc":["dangerous_goods.pdf"],"gold_keyword":"dry ice","should_refuse":false},
+  {"id":"h07","category":"multi","question":"My flight was disrupted. Can I get a full refund if I choose not to travel?","history":[],"expected_answer":"","source_doc":["disrupted_travel.pdf","refunds_changes.pdf","emirates_conditions_of_carriage.pdf"],"gold_keyword":"","should_refuse":false},
+  {"id":"h08","category":"not_in_docs","question":"What is the best hotel near Dubai International Airport?","history":[],"expected_answer":"","source_doc":[],"gold_keyword":"","should_refuse":true},
+  {"id":"h09","category":"not_in_docs","question":"Can you book a flight for me from London to Sydney?","history":[],"expected_answer":"","source_doc":[],"gold_keyword":"","should_refuse":true},
+  {"id":"h10","category":"not_in_docs","question":"What is the current exchange rate between USD and AED?","history":[],"expected_answer":"","source_doc":[],"gold_keyword":"","should_refuse":true}
+]

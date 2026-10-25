@@ -1,0 +1,5 @@
+[
+  {"flight": "EK501", "from": "DXB", "to": "LHR", "status": "On time", "gate": "B12", "note": "Demo data"},
+  {"flight": "EK202", "from": "DXB", "to": "JFK", "status": "Delayed 25 min", "gate": "C7", "note": "Demo data"},
+  {"flight": "EK500", "from": "LHR", "to": "DXB", "status": "Boarding", "gate": "A4", "note": "Demo data"}
+]

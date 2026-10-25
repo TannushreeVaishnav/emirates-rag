@@ -1,0 +1,1 @@
+"""Emirates RAG Bot package."""
