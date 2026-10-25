@@ -1,3 +1,7 @@
+[server]
+# Disable dependency file watching; refresh/restart manually after source edits.
+fileWatcherType = "none"
+
 [browser]
 gatherUsageStats = false
 

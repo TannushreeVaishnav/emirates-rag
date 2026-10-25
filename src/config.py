@@ -44,7 +44,7 @@ class Settings(BaseSettings):
     # ── Embedding & retrieval ─────────────────────────────────────────────────
     embedding_model: str = "BAAI/bge-small-en-v1.5"   # fast, good quality, free
     top_k: int = 4           # number of chunks returned per query
-    temperature: float = 0.1 # low temp → more deterministic policy answers
+    temperature: float = 0.0 # minimize variation in policy generation and assessment
     market: str = "IN"       # controls which market-specific rules apply
 
     # ── Chunking (changed via env vars during Phase 8 experiments) ────────────

@@ -9,6 +9,8 @@ Design:
   - Primary provider (Gemini) is tried first.
   - On rate-limit (429) or fatal errors, it fails over to Groq immediately
     without retrying — retrying an exhausted quota just wastes time.
+  - Rate-limited provider/model endpoints are skipped for the rest of the turn;
+    start_tracking() resets that suppression for the next turn.
   - On transient errors (5xx, timeout, connection reset), it retries with
     exponential backoff before failing over.
   - A ContextVar (UsageTracker) records every LLM call made during a single
@@ -64,6 +66,7 @@ class UsageTracker:
 
     def __init__(self) -> None:
         self.calls: list[CallRecord] = []
+        self._rate_limited: dict[tuple[str, str | int], Exception] = {}
 
     @property
     def last_ok(self) -> str:
@@ -124,6 +127,15 @@ def classify(exc: Exception) -> str:
     return "fatal"
 
 
+def _endpoint_key(name: str, model) -> tuple[str, str | int]:
+    """Identify the provider/model, independent of its main or helper role."""
+    provider = "groq" if name == "groq-fast" else name
+    model_name = getattr(model, "model_name", None) or getattr(model, "model", None)
+    # Lightweight/custom runnables may not expose a model name. Only share
+    # their suppression when the same model object is reused.
+    return provider, model_name if isinstance(model_name, str) else id(model)
+
+
 class LLMGateway(Runnable[LanguageModelInput, BaseMessage]):
     """
     A LangChain Runnable that wraps multiple providers and handles failover.
@@ -161,6 +173,10 @@ class LLMGateway(Runnable[LanguageModelInput, BaseMessage]):
         last_err: Exception | None = None
 
         for idx, (name, model) in enumerate(self.providers):
+            endpoint = _endpoint_key(name, model)
+            if tracker and endpoint in tracker._rate_limited:
+                last_err = tracker._rate_limited[endpoint]
+                continue
             for attempt in range(1, self.attempts + 1):
                 t0 = time.perf_counter()
                 try:
@@ -179,6 +195,8 @@ class LLMGateway(Runnable[LanguageModelInput, BaseMessage]):
                     kind = classify(e)
                     last_err = e
                     if tracker:
+                        if kind == "rate_limit":
+                            tracker._rate_limited[endpoint] = e
                         tracker.calls.append(
                             CallRecord(
                                 name, False,
