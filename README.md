@@ -205,21 +205,75 @@ pytest tests/ -v
 
 ## Evaluation
 
+Open **Evaluation** in the Streamlit sidebar to inspect saved runs. The dashboard
+is read-only: viewing, filtering, comparing, or downloading results never calls
+an LLM.
+
+Run commands from the repository root with the virtual environment activated
+(`.\.venv\Scripts\Activate.ps1` on Windows or `source .venv/bin/activate` on
+macOS/Linux). Install `requirements.txt` and build the local index with
+`python -m src.ingest` first. The first embedding-model download needs internet;
+subsequent retrieval-only runs can use the cached model.
+
+For live generation/judging, configure `GOOGLE_API_KEY` and/or `GROQ_API_KEY` in
+`.env`. No provider key is needed for retrieval-only evaluation or viewing reports.
+
 ```bash
-# Retrieval-only (no API cost): compare 6 chunking configurations
+# Offline retrieval benchmark; no generation/judging requests
+python -m eval.run_eval --retrieval-only --no-judge --max-api-calls 0 --label retrieval_offline
+
+# Explicit live evaluation: capped across generation, history replay, retries,
+# fallbacks and judging. A small budget normally produces a partial graph run.
+python -m eval.run_eval --config graph --label graph_judged --max-api-calls 10 --sleep 25
+
+# Generate answers without the extra LLM judge calls (still uses the API)
+python -m eval.run_eval --config baseline --no-judge --limit 6 --max-api-calls 10 --sleep 25
+
+# View reports directly, or use the Evaluation page in the main app
+streamlit run pages/1_Evaluation.py
+
+# Existing tools remain available
 python -m eval.run_experiments chunking
-
-# Full graph eval with LLM judge
-python -m eval.run_eval --config graph --label final --sleep 8
-
-# Red-team: 16 adversarial inputs
 python -m eval.run_redteam
-
-# Analyse failures from the most recent CSV
 python -m eval.failures
 ```
 
-Results are saved to `eval/results/summary.md` and per-question CSVs.
+Runs save versioned JSON reports, per-question CSVs and `summary.md` under
+`eval/results/`. The dashboard shows sample sizes, categories, failures, missing
+scores and incomplete-budget coverage. Legacy CSV-only results are retained but
+cannot provide all denominators or metadata.
+For the main application, run `streamlit run app.py` and select **Evaluation** in
+the sidebar. Restart Streamlit after updating this code because file watching is
+disabled. New CLI-generated reports appear after refreshing/rerunning the page.
+
+**Metric interpretation**
+
+- Retrieval: hit rate, source-label precision/recall/F1@k, reciprocal rank,
+  average precision and nDCG. These are **source-level proxies**, not passage-level
+  relevance judgments or answer accuracy. Existing source labels are not an
+  exhaustive relevance set; alternate valid sources can affect these estimates.
+- Answers: normalized exact match and token precision/recall/F1 against available
+  references. Paraphrases can score poorly despite being correct.
+- LLM judgment: faithfulness, relevance and reference-based correctness estimates.
+  Judge scores are not ground truth; using the generation provider as judge can
+  introduce bias.
+- Refusals: decision accuracy, refusal precision/recall/F1 and false-refusal rate.
+  Correctly choosing to answer does **not** establish that the answer is correct.
+- Citations: numeric-reference validity and overlap with labeled sources; source
+  overlap alone does not prove that an individual claim is supported.
+- Operations: errors, completion/scoring coverage, latency percentiles and observed
+  provider request counts. Failed or unassessed cases must not masquerade as success.
+
+Six questions in `eval/qa_set.json` have reference answers curated from the local
+policy documents: Economy cabin baggage, power banks, online check-in, wheelchair
+requests, infants and refunds. Other references remain unannotated. Missing scores
+are **Not measured**, never zero or inferred accuracy. Local references and collection
+dates do not prove that a policy is current. Retrieval-only runs do not measure
+generated-answer quality.
+Retrieval-only runs search the question as written without replaying conversation
+history. Add `--exclude-category follow_up` to benchmark standalone retrieval;
+use a graph run to evaluate contextual follow-up resolution.
+
 
 ---
 

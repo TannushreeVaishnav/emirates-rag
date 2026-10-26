@@ -11,6 +11,8 @@ def test_app_answers_a_question(monkeypatch):
         pytest.skip("build the index first: python -m src.ingest")
 
     import src.graph as g
+    import src.retriever as retriever
+    monkeypatch.setattr(retriever, "_store", lambda: object())
 
     def fake_chat(message, thread_id="default"):
         return {
